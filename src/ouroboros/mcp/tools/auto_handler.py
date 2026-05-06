@@ -204,6 +204,10 @@ def _result_meta(result: AutoPipelineResult) -> dict[str, Any]:
     }
     if result.pending_question:
         meta["pending_question"] = result.pending_question
+    if result.run_handoff_status:
+        meta["run_handoff_status"] = result.run_handoff_status
+    if result.run_handoff_guidance:
+        meta["run_handoff_guidance"] = result.run_handoff_guidance
     return meta
 
 
@@ -376,6 +380,10 @@ def _format_result(result: AutoPipelineResult) -> str:
                 f"  session_id: {result.run_session_id}",
             ]
         )
+    if result.run_handoff_status:
+        lines.append(f"Run handoff status: {result.run_handoff_status}")
+    if result.run_handoff_guidance:
+        lines.append(f"Run handoff guidance: {result.run_handoff_guidance}")
     if result.assumptions:
         lines.append("Assumptions:")
         lines.extend(f"- {item}" for item in result.assumptions)
