@@ -27,6 +27,48 @@ def _make_entry(name: str = "github-pr-ops", version: str = "0.1.0") -> LockEntr
     )
 
 
+_FORBIDDEN_TOML_CONTROL_BYTES: tuple[str, ...] = tuple(chr(b) for b in [*range(0x00, 0x20), 0x7F])
+
+
+@pytest.mark.parametrize("ctrl_char", _FORBIDDEN_TOML_CONTROL_BYTES)
+def test_toml_str_escapes_all_control_chars(tmp_path: Path, ctrl_char: str) -> None:
+    """Lockfile entries containing any C0 byte (0x00–0x1f) or DEL (0x7f)
+    must round-trip through tomllib.
+
+    Earlier the escape table covered only ``\\``, ``"``, ``\\n``, ``\\t``
+    and ``\\r``, so every other ``ord(ch) < 0x20`` byte and ``\\x7f``
+    were emitted verbatim. ``tomllib.loads`` rejects those bare bytes
+    inside a basic string with ``Illegal character ...`` — the very next
+    ``Lockfile.read()`` after such an ``add()`` would crash.
+
+    Iterates the **full forbidden range** rather than spot-checking a
+    handful, so the regression coverage matches the implementation
+    (which now handles every byte in the same range). Per ouroboros-
+    agent[bot] non-blocking suggestion on PR #795.
+    """
+    lock = Lockfile(tmp_path / "plugins.lock")
+    # Stuff the control character into a value that survives across the lock
+    # boundary — manifest_checksum is a free-form string in the schema.
+    entry = LockEntry(
+        name="ctrl-char-plugin",
+        version="0.1.0",
+        source_kind="git",
+        repository="https://example.invalid/repo",
+        git_sha="deadbeef",
+        manifest_checksum=f"sha256:abc{ctrl_char}123",
+        installed_at="2026-05-08T03:14:00Z",
+        plugin_home="~/.ouroboros/plugins/ctrl-char-plugin",
+    )
+    lock.add(entry)
+
+    # The bug surfaces here: tomllib refuses to parse the file the lockfile
+    # itself just wrote.
+    fresh = Lockfile(tmp_path / "plugins.lock")
+    entries = fresh.read()
+    assert "ctrl-char-plugin" in entries
+    assert entries["ctrl-char-plugin"].manifest_checksum == f"sha256:abc{ctrl_char}123"
+
+
 def test_install_then_read(tmp_path: Path) -> None:
     """Test 1: install → lockfile entry present; round-trip through TOML."""
     lock = Lockfile(tmp_path / "plugins.lock")
