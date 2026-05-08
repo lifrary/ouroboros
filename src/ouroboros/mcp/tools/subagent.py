@@ -25,6 +25,7 @@ Payload structure:
             "prompt": str,      # full prompt for subagent LLM
             "model": str|None,  # optional model override hint
             "context": dict,    # original tool args for round-trip
+            "timeout": dict|None, # optional structural child timeout budget
         }
     }
 """
@@ -71,6 +72,7 @@ class SubagentPayload:
     agent: str = "general"
     model: str | None = None
     context: dict[str, Any] = field(default_factory=dict)
+    timeout: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to plain dict for JSON transport in MCPToolResult.meta."""
@@ -81,6 +83,7 @@ class SubagentPayload:
             "prompt": self.prompt,
             "model": self.model,
             "context": self.context,
+            "timeout": self.timeout,
         }
 
 
@@ -97,6 +100,7 @@ def build_subagent_payload(
     agent: str = "general",
     model: str | None = None,
     context: dict[str, Any] | None = None,
+    timeout: dict[str, Any] | None = None,
 ) -> SubagentPayload:
     """Build a SubagentPayload with validation.
 
@@ -107,6 +111,7 @@ def build_subagent_payload(
         agent: OpenCode subagent type. Default "general".
         model: Optional model override hint for the subagent.
         context: Original tool arguments for bridge round-trip.
+        timeout: Optional bridge-enforced child timeout metadata.
 
     Returns:
         Validated SubagentPayload.
@@ -128,7 +133,57 @@ def build_subagent_payload(
         agent=agent,
         model=model,
         context=context or {},
+        timeout=timeout,
     )
+
+
+def _positive_number(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return numeric
+
+
+def _ralph_timeout_metadata(
+    *,
+    per_iteration_timeout_seconds: float | None,
+    max_total_seconds: float | None,
+) -> dict[str, Any] | None:
+    """Build bridge-enforced timeout metadata for plugin-mode Ralph.
+
+    The OpenCode bridge owns one session-scoped abort timer per child; it has
+    no per-iteration reset hook because the bridge cannot observe iteration
+    boundaries inside the foreign child session. The bridge timer must
+    therefore represent a *whole-session ceiling only*, driven exclusively by
+    ``max_total_seconds``. Mapping ``per_iteration_timeout_seconds`` onto the
+    same timer (e.g. via ``min(per_iteration, max_total)``) would silently
+    abort healthy multi-iteration runs at the per-iteration budget, even when
+    no single generation hung — see #790 review-3.
+
+    Per-iteration semantics still travel to the child via the prompt and
+    ``context["per_iteration_timeout_seconds"]`` for in-child self-enforcement;
+    the value is also echoed in this metadata for observability, but it does
+    NOT influence ``timeout_ms`` or ``stop_reason``. When ``max_total_seconds``
+    is None there is no whole-session ceiling to enforce, so no metadata is
+    emitted (the bridge falls back to its environment-default child timeout).
+    """
+    per_iteration = _positive_number(per_iteration_timeout_seconds)
+    max_total = _positive_number(max_total_seconds)
+    if max_total is None:
+        return None
+    return {
+        "timeout_ms": max(1, int(max_total * 1000)),
+        "stop_reason": "wall_clock_exhausted",
+        "source": "max_total_seconds",
+        "behavior": "session_ceiling_only",
+        "per_iteration_timeout_seconds": per_iteration,
+        "max_total_seconds": max_total,
+    }
 
 
 def build_subagent_result(
@@ -1222,6 +1277,10 @@ def build_ralph_subagent(
             check the cumulative wall-clock elapsed since the loop started
             BEFORE launching each iteration and surface
             ``stop_reason=wall_clock_exhausted`` to the parent on exhaustion.
+            On the plugin path, ``max_total_seconds`` is *also* the only true
+            whole-session ceiling that drives the bridge's session-kill timer
+            (see ``_ralph_timeout_metadata``); the per-iteration bound is
+            advisory because the bridge cannot reset its timer per iteration.
             When ``None``, the field is omitted from both prompt and context
             (legacy shape preserved for callers that don't care about the
             bound).
@@ -1364,4 +1423,8 @@ do not enqueue another background Ralph job."""
         title="Ralph: full loop",
         prompt=prompt,
         context=context,
+        timeout=_ralph_timeout_metadata(
+            per_iteration_timeout_seconds=per_iteration_timeout_seconds,
+            max_total_seconds=max_total_seconds,
+        ),
     )

@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 import inspect
 import threading
+import time
 from typing import Any, Protocol
 
 from ouroboros.auto.blocker_attribution import record_authoring_backend
@@ -43,6 +44,13 @@ class RunStarter(Protocol):
 
 SeedSaver = Callable[[Seed], str]
 SeedLoader = Callable[[str], Seed]
+
+# Tool-name marker recorded on ``state.last_tool_name`` whenever the top-level
+# pipeline deadline (#779) trips. Distinct from per-phase tool names so that
+# recovery decisions and surfaces can detect "deadline-expired" vs ordinary
+# per-tool blockers without scanning the error message.
+PIPELINE_DEADLINE_TOOL_NAME = "pipeline_deadline"
+_RESUME_EXPIRED_MESSAGE = "pipeline_timeout (deadline expired before resume)"
 
 
 _RETRY_GUIDANCE_PHRASE = "retried once with idempotency key"
@@ -139,6 +147,24 @@ class AutoPipeline:
         )
         if self.skip_run and not state.skip_run:
             state.skip_run = True
+        # Top-level deadline check on resume (#779). When ``deadline_at`` is
+        # already set and has passed before this process even starts work,
+        # immediately transition to BLOCKED so no phase work is invoked. The
+        # message is the literal one the issue contract requires so external
+        # surfaces can distinguish a resume-expired session from a freshly
+        # tripped deadline mid-run.
+        if (
+            state.deadline_at is not None
+            and not state.is_terminal()
+            and state.is_deadline_expired()
+        ):
+            state.last_tool_name = PIPELINE_DEADLINE_TOOL_NAME
+            state.mark_blocked(
+                _RESUME_EXPIRED_MESSAGE,
+                tool_name=PIPELINE_DEADLINE_TOOL_NAME,
+            )
+            self._save(state)
+            return self._result(state, ledger, blocker=state.last_error)
         resume_tool_name = state.last_tool_name
         if state.seed_artifact:
             try:
@@ -182,10 +208,33 @@ class AutoPipeline:
                 resume_phase,
                 f"resuming {resume_phase.value} after {previous_phase.value}: {state.last_error or 'no error recorded'}",
             )
+            # Legacy auto sessions saved before #779 had no
+            # ``deadline_at_epoch``, and ``from_dict()`` deliberately leaves
+            # the deadline unset for terminal phases. After recovering them
+            # back to a working phase, arm the deadline so subsequent
+            # ``_enforce_deadline`` checks are not silent no-ops for the
+            # rest of this resume (#790 review-4). ``arm_deadline`` is
+            # idempotent — non-legacy resumes are unaffected.
+            state.arm_deadline()
             self._save(state)
 
         review: SeedReview | None = None
+        if self._enforce_deadline(state):
+            return self._result(state, ledger, blocker=state.last_error)
         if state.phase in {AutoPhase.CREATED, AutoPhase.INTERVIEW}:
+            # Arm the top-level pipeline deadline (#779) on the first
+            # CREATED → INTERVIEW transition so every later phase entry can
+            # compare ``time.monotonic()`` against a stable absolute target.
+            # Idempotent for resumed sessions whose deadline already armed.
+            # Persist immediately so a crash during the first
+            # ``interview_driver.run()`` cannot leave the saved state
+            # without ``deadline_at_epoch`` — otherwise a resumed session
+            # would silently extend the pipeline by re-arming a fresh 2h
+            # window and break the "preserved across process restarts"
+            # contract (#790 review-5).
+            if state.phase == AutoPhase.CREATED:
+                state.arm_deadline()
+                self._save(state)
             if state.phase == AutoPhase.INTERVIEW and state.interview_completed:
                 if not state.interview_session_id:
                     state.mark_blocked(
@@ -207,7 +256,22 @@ class AutoPipeline:
                 )
                 self._save(state)
             else:
-                interview = await self.interview_driver.run(state, ledger)
+                interview_phase_timeout = state.phase_timeout_seconds(AutoPhase.INTERVIEW)
+                interview_timeout = self._deadline_capped_timeout(state, interview_phase_timeout)
+                try:
+                    interview = await asyncio.wait_for(
+                        self.interview_driver.run(state, ledger),
+                        timeout=interview_timeout,
+                    )
+                except TimeoutError:
+                    if self._enforce_deadline(state):
+                        return self._result(state, ledger, blocker=state.last_error)
+                    state.mark_blocked(
+                        f"interview phase exceeded {interview_phase_timeout:.0f}s",
+                        tool_name="interview_driver",
+                    )
+                    self._save(state)
+                    return self._result(state, ledger, blocker=state.last_error)
                 if interview.status == "blocked":
                     return self._result(state, ledger, blocker=interview.blocker)
                 state.interview_completed = True
@@ -224,6 +288,8 @@ class AutoPipeline:
             self._save(state)
             return self._result(state, ledger, blocker=state.last_error)
 
+        if self._enforce_deadline(state):
+            return self._result(state, ledger, blocker=state.last_error)
         if state.phase == AutoPhase.SEED_GENERATION:
             if state.seed_artifact:
                 try:
@@ -245,10 +311,11 @@ class AutoPipeline:
                     )
                     self._save(state)
                     return self._result(state, ledger, blocker=state.last_error)
+                seed_timeout = self._deadline_capped_timeout(state, self.seed_timeout_seconds)
                 try:
                     seed = await asyncio.wait_for(
                         self.seed_generator(state.interview_session_id),
-                        timeout=self.seed_timeout_seconds,
+                        timeout=seed_timeout,
                     )
                     if not isinstance(seed, Seed):
                         msg = f"seed generator returned {type(seed).__name__}, expected Seed"
@@ -257,6 +324,9 @@ class AutoPipeline:
                     state.seed_artifact = seed.to_dict()
                     state.seed_origin = SeedOrigin.AUTO_PIPELINE
                 except TimeoutError as exc:
+                    if self._enforce_deadline(state):
+                        record_authoring_backend(state)
+                        return self._result(state, ledger, blocker=state.last_error)
                     state.mark_blocked(
                         f"seed generation timed out after {self.seed_timeout_seconds:.0f}s",
                         tool_name="seed_generator",
@@ -309,6 +379,8 @@ class AutoPipeline:
             self._save(state)
             return self._result(state, ledger, blocker=state.last_error)
 
+        if self._enforce_deadline(state):
+            return self._result(state, ledger, blocker=state.last_error)
         if state.phase == AutoPhase.REVIEW:
             reviewer = self.reviewer or SeedReviewer(self.grade_gate)
             repairer = self.repairer or SeedRepairer(reviewer=reviewer)
@@ -327,13 +399,16 @@ class AutoPipeline:
             # ``SeedRepairer.converge`` does declare it.
             if _accepts_keyword(repairer.converge, "cancel_event"):
                 converge_kwargs["cancel_event"] = cancel_event
+            bounded_repair_timeout = self._deadline_capped_timeout(state, repair_timeout)
             try:
                 seed, review, repairs = await asyncio.wait_for(
                     asyncio.to_thread(repairer.converge, seed, **converge_kwargs),
-                    timeout=repair_timeout,
+                    timeout=bounded_repair_timeout,
                 )
             except TimeoutError:
                 cancel_event.set()
+                if self._enforce_deadline(state):
+                    return self._result(state, ledger, blocker=state.last_error)
                 state.mark_blocked(
                     f"repair phase exceeded {repair_timeout:.0f}s",
                     tool_name="seed_repairer",
@@ -379,6 +454,8 @@ class AutoPipeline:
                 self._save(state)
                 return self._result(state, ledger, review=review)
 
+        if self._enforce_deadline(state):
+            return self._result(state, ledger, review=review, blocker=state.last_error)
         if state.phase == AutoPhase.RUN:
             attached = self._attach_run_if_requested(state)
             if attached is not None:
@@ -406,7 +483,23 @@ class AutoPipeline:
                 return self._result(state, ledger, review=review, blocker=state.last_error)
             if review is None:
                 reviewer = self.reviewer or SeedReviewer(self.grade_gate)
-                review = reviewer.review(seed, ledger=ledger)
+                review_timeout = self._deadline_capped_timeout(
+                    state, state.phase_timeout_seconds(AutoPhase.REVIEW)
+                )
+                try:
+                    review = await asyncio.wait_for(
+                        asyncio.to_thread(reviewer.review, seed, ledger=ledger),
+                        timeout=review_timeout,
+                    )
+                except TimeoutError:
+                    if self._enforce_deadline(state):
+                        return self._result(state, ledger, blocker=state.last_error)
+                    state.mark_blocked(
+                        "review timed out before run could be started",
+                        tool_name="seed_reviewer",
+                    )
+                    self._save(state)
+                    return self._result(state, ledger, blocker=state.last_error)
                 state.last_grade = review.grade_result.grade.value
                 state.findings = [asdict(finding) for finding in review.findings]
                 self._maybe_emit_grade(state)
@@ -487,15 +580,18 @@ class AutoPipeline:
             state.run_start_attempted = True
             self._save(state)
             run_meta: dict[str, Any] | None = None
+            run_start_timeout = self._deadline_capped_timeout(state, self.run_start_timeout_seconds)
             try:
                 run_meta = await asyncio.wait_for(
                     self.run_starter(seed, idempotency_key=idempotency_key),
-                    timeout=self.run_start_timeout_seconds,
+                    timeout=run_start_timeout,
                 )
                 if not isinstance(run_meta, dict):
                     msg = f"run starter returned {type(run_meta).__name__}, expected dict"
                     raise TypeError(msg)
             except TimeoutError as exc:
+                if self._enforce_deadline(state):
+                    return self._result(state, ledger, review=review, blocker=state.last_error)
                 _mark_unknown_run_handoff(state, status="unknown_timeout")
                 if retried:
                     state.run_handoff_guidance = (
@@ -595,6 +691,48 @@ class AutoPipeline:
             # timeout and no-handle paths share this same retry slot.
             self._save(state)
             retried = True
+
+    def _deadline_capped_timeout(self, state: AutoPipelineState, phase_timeout: float) -> float:
+        """Return ``phase_timeout`` capped by the remaining pipeline deadline.
+
+        Without this cap, ``_enforce_deadline`` only fires at phase
+        boundaries — a single ``await`` inside the interview / seed-gen /
+        repair / run-start path could spend the full per-phase timeout
+        even after the top-level deadline expired, breaking the public
+        ``pipeline_timeout`` contract (#790 review-6). Returns
+        ``phase_timeout`` unchanged when no deadline is armed; returns a
+        near-zero floor when the deadline is already past so the next
+        ``asyncio.wait_for`` trips immediately and routes the failure into
+        ``_enforce_deadline``.
+        """
+        if state.deadline_at is None:
+            return float(phase_timeout)
+        remaining = state.deadline_at - time.monotonic()
+        if remaining <= 0:
+            return 0.0
+        return float(min(float(phase_timeout), remaining))
+
+    def _enforce_deadline(self, state: AutoPipelineState) -> bool:
+        """Return True when the pipeline must abort because the deadline expired.
+
+        Mutates ``state`` to ``BLOCKED`` with ``tool_name=pipeline_deadline``
+        and a ``pipeline_timeout`` error message, then persists. Callers must
+        return immediately when this returns True. No-op when the deadline is
+        unset or the state is already terminal.
+        """
+        if state.is_terminal() or state.deadline_at is None:
+            return False
+        if not state.is_deadline_expired():
+            return False
+        remaining = state.deadline_at - time.monotonic()
+        message = (
+            f"pipeline_timeout: deadline exceeded by "
+            f"{abs(remaining):.1f}s during {state.phase.value}"
+        )
+        state.last_tool_name = PIPELINE_DEADLINE_TOOL_NAME
+        state.mark_blocked(message, tool_name=PIPELINE_DEADLINE_TOOL_NAME)
+        self._save(state)
+        return True
 
     def _load_seed(self, state: AutoPipelineState, seed_path: str) -> Seed | None:
         if self.seed_loader is None:
