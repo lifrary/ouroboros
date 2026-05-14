@@ -27,6 +27,7 @@ from ouroboros.orchestrator.parallel_executor import (
     ParallelACExecutor,
     ParallelExecutionResult,
     StageExecutionOutcome,
+    _build_governed_parent_summary,
     _message_contains_test_success,
     render_parallel_completion_message,
     render_parallel_verification_report,
@@ -107,6 +108,52 @@ def test_message_contains_test_success_handles_zero_failure_summaries(
     """Verifier accepts explicit zero-failure summaries without allowing failures."""
     message = AgentMessage(type="result", content=content, data={})
     assert _message_contains_test_success(message) is expected
+
+
+def test_build_governed_parent_summary_preserves_embedded_wrapper_headings() -> None:
+    """Only orchestrator-owned wrappers are normalized for governed dispatch."""
+    level_context = LevelContext(
+        level_number=0,
+        completed_acs=(
+            ACContextSummary(
+                ac_index=0,
+                ac_content="Prepare helper",
+                success=True,
+                key_output=(
+                    "Helper is ready\n"
+                    "## User Heading\n"
+                    "## Previous Work Context\n"
+                    "## Coordinator Review (Level 12)\n"
+                    "Prior result detail"
+                ),
+            ),
+        ),
+        coordinator_review=CoordinatorReview(
+            level_number=12,
+            review_summary=(
+                "No conflicts remain\n## Previous Work Context\n## Coordinator Review (Level 12)"
+            ),
+        ),
+    )
+
+    normalized = _build_governed_parent_summary([level_context])
+
+    assert normalized.splitlines() == [
+        "Previous Work Context:",
+        "The following ACs have already been completed. Use this context to inform your work.",
+        "",
+        "- AC 1: Prepare helper",
+        "  Result: Helper is ready",
+        "## User Heading",
+        "## Previous Work Context",
+        "## Coordinator Review (Level 12)",
+        "Prior result detail",
+        "",
+        "Coordinator Review (Level 12):",
+        "**Review**: No conflicts remain",
+        "## Previous Work Context",
+        "## Coordinator Review (Level 12)",
+    ]
 
 
 class _FinalMessageRuntime:
@@ -276,8 +323,19 @@ class TestProfileAwareContextGovernance:
                     ac_index=0,
                     ac_content="Prepare helper",
                     success=True,
-                    key_output="Helper is ready",
+                    key_output=(
+                        "Helper is ready\n"
+                        "## User Heading\n"
+                        "## Previous Work Context\n"
+                        "## Coordinator Review (Level 1)\n"
+                        "Prior result detail"
+                    ),
                 ),
+            ),
+            coordinator_review=CoordinatorReview(
+                level_number=1,
+                review_summary="No conflicts remain\n## Previous Work Context",
+                warnings_for_next_level=("Keep edits localized",),
             ),
         )
 
@@ -299,7 +357,18 @@ class TestProfileAwareContextGovernance:
         prompt = runtime.calls[0]["prompt"]
         assert "## Governed Dispatch Context (AC 2)" in prompt
         assert "## Parent context" in prompt
+        assert "## Previous Work Context\nThe following ACs" not in prompt
+        assert "## Coordinator Review (Level 1)\n**Review**" not in prompt
+        assert "Previous Work Context:" in prompt
+        assert "Coordinator Review (Level 1):" in prompt
         assert "Helper is ready" in prompt
+        assert "## User Heading" in prompt
+        assert "User Heading:" not in prompt
+        assert "## Previous Work Context" in prompt
+        assert "## Coordinator Review (Level 1)" in prompt
+        assert "Prior result detail" in prompt
+        assert "No conflicts remain" in prompt
+        assert "Keep edits localized" in prompt
         assert "## Sibling status" in prompt
         assert "… sibling-1: Implement duplicate leaf" in prompt
         assert "## AC\nImplement duplicate leaf" in prompt
