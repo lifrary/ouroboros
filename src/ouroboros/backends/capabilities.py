@@ -228,6 +228,17 @@ _CAPABILITIES: tuple[BackendCapability, ...] = (
         soft_tool_enforcement=True,
     ),
     BackendCapability(
+        name="goose",
+        aliases=("goose_cli",),
+        supports_runtime=True,
+        supports_llm=True,
+        supports_interview_driver=True,
+        switchable_runtime=True,
+        cli_name="goose",
+        cli_config_key="goose_cli_path",
+        soft_tool_enforcement=True,
+    ),
+    BackendCapability(
         name="litellm",
         aliases=("openai", "openrouter"),
         supports_llm=True,

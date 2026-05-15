@@ -33,6 +33,7 @@ Functions:
     get_codex_cli_path: Get Codex CLI path from env var or config
     get_opencode_cli_path: Get OpenCode CLI path from env var or config
     get_hermes_cli_path: Get Hermes CLI path from env var or config
+    get_goose_cli_path: Get Goose CLI path from env var or config
 """
 
 import ast
@@ -981,6 +982,40 @@ def get_hermes_cli_path() -> str | None:
         hermes_path = getattr(config.orchestrator, "hermes_cli_path", None)
         if hermes_path:
             return hermes_path
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_goose_cli_path() -> str | None:
+    """Get Goose CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_GOOSE_CLI_PATH environment variable
+        2. config.yaml orchestrator.goose_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Stale env var / config values that don't point to an executable are
+    treated as missing so callers can fall back to PATH discovery instead
+    of persisting an unusable path.
+
+    Returns:
+        Path to Goose CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_GOOSE_CLI_PATH", "").strip()
+    if env_path:
+        resolved = str(Path(env_path).expanduser())
+        if shutil.which(resolved):
+            return resolved
+
+    try:
+        config = load_config()
+        goose_path = getattr(config.orchestrator, "goose_cli_path", None)
+        if goose_path:
+            resolved = str(Path(goose_path).expanduser())
+            if shutil.which(resolved):
+                return resolved
     except ConfigError:
         pass
 
