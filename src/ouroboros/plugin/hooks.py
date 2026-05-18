@@ -17,10 +17,10 @@ What this module owns:
 * :class:`HookFailurePolicy` — the v1 failure policies (``fail_open``
   / ``fail_closed``).
 * :data:`HOOK_OUTCOME_AUDIT_EVENTS` — the v1 hook outcome event names
-  currently vendored in the manifest/audit schemas
-  (``plugin.hook.blocked`` / ``plugin.hook.failed``). These are not the
-  full future hook telemetry set; successful hook start/completion
-  events remain deferred until their schema/runtime slice lands.
+  currently vendored in the manifest schemas
+  (``plugin.hook.blocked`` / ``plugin.hook.failed``). The v0.3 audit-event
+  schema also vendors the successful hook start/completion names for forward
+  compatibility, but runtime emission of those events remains deferred.
 * :func:`is_v1_hook_kind` / :func:`is_v1_failure_policy` — helpers
   consumed by manifest validators in follow-up PRs. They live here so
   the contract is the single source of truth.
@@ -130,21 +130,27 @@ class HookFailurePolicy(StrEnum):
 
 
 #: V1 hook outcome event names currently vendored in the
-#: manifest/audit schemas. These are exported as constants so manifest
+#: manifest schemas. These are exported as constants so manifest
 #: validators and audit consumers reference the same string set the
 #: wrapper will emit for hook block/failure outcomes when dispatch
 #: lands in a follow-up PR.
 #:
 #: This is deliberately narrower than the full future hook telemetry
-#: vocabulary in ``docs/rfc/userlevel-plugins.md``. Successful
-#: ``plugin.hook.invoked`` / ``plugin.hook.completed`` emission remains
-#: deferred until the upstream audit schema and core runtime wiring both
-#: support those events.
+#: vocabulary in ``docs/rfc/userlevel-plugins.md``. The v0.3 audit-event
+#: schema vendors ``plugin.hook.invoked`` / ``plugin.hook.completed`` for
+#: forward compatibility, but core runtime emission remains deferred until
+#: dispatch wiring lands.
+HOOK_INVOKED_EVENT: Final[str] = "plugin.hook.invoked"
+HOOK_COMPLETED_EVENT: Final[str] = "plugin.hook.completed"
 HOOK_BLOCKED_EVENT: Final[str] = "plugin.hook.blocked"
 HOOK_FAILED_EVENT: Final[str] = "plugin.hook.failed"
+HOOK_RUNTIME_AUDIT_EVENTS: Final[frozenset[str]] = frozenset(
+    {HOOK_INVOKED_EVENT, HOOK_COMPLETED_EVENT}
+)
 HOOK_OUTCOME_AUDIT_EVENTS: Final[frozenset[str]] = frozenset(
     {HOOK_BLOCKED_EVENT, HOOK_FAILED_EVENT}
 )
+HOOK_EVENT_TYPES: Final[frozenset[str]] = HOOK_RUNTIME_AUDIT_EVENTS | HOOK_OUTCOME_AUDIT_EVENTS
 
 #: Backward-compatible alias for the original #984 export. Prefer
 #: :data:`HOOK_OUTCOME_AUDIT_EVENTS` in new call sites so the name does
@@ -208,10 +214,14 @@ def is_hook_lifecycle_scope(value: str) -> bool:
 __all__ = [
     "HOOK_AUDIT_EVENTS",
     "HOOK_BLOCKED_EVENT",
+    "HOOK_COMPLETED_EVENT",
+    "HOOK_EVENT_TYPES",
     "HOOK_FAILED_EVENT",
+    "HOOK_INVOKED_EVENT",
     "HOOK_LIFECYCLE_READ_SCOPE",
     "HOOK_LIFECYCLE_SCOPES",
     "HOOK_OUTCOME_AUDIT_EVENTS",
+    "HOOK_RUNTIME_AUDIT_EVENTS",
     "DeferredHookKind",
     "ExcludedHookKind",
     "HookFailurePolicy",
