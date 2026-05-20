@@ -166,17 +166,39 @@ def is_mcp_configured() -> bool:
         return False
 
 
+def _has_prior_install_state() -> bool:
+    """Detect a prior Ouroboros install when ``prefs.json`` is absent.
+
+    A missing ``prefs.json`` usually means a genuine first run, but on its own
+    it is not sufficient: ``ooo setup`` and the MCP runtime can leave behind
+    config, credentials, or the event-sourcing database — and register the MCP
+    server — without ever writing ``prefs.json``. The welcome flow is the only
+    path that writes the ``welcomeCompleted`` gate-key, and it is skippable, so
+    a user who configured Ouroboros but never finished (or skipped) the welcome
+    is otherwise treated as first-time forever and re-nagged on every prompt.
+    Any of these install signals means the user is past first-touch.
+    """
+    ouro_dir = Path.home() / ".ouroboros"
+    markers = ("config.yaml", "credentials.yaml", "ouroboros.db")
+    if any((ouro_dir / marker).exists() for marker in markers):
+        return True
+    return is_mcp_configured()
+
+
 def is_first_time() -> bool:
     """Check if this is the user's first interaction.
 
-    Older onboarding flows wrote ``welcomeShown`` or other preference keys without
-    ``welcomeCompleted``. Treat any valid existing prefs as a non-first-run state
-    so upgrades do not repeatedly auto-trigger the welcome experience.
+    Older onboarding flows wrote ``welcomeShown`` or other preference keys
+    without ``welcomeCompleted``. Treat any valid existing prefs as a
+    non-first-run state so upgrades do not repeatedly auto-trigger the welcome
+    experience. When ``prefs.json`` is missing entirely, fall back to other
+    install signals (see ``_has_prior_install_state``) so a configured user who
+    never completed the welcome flow is not nagged on every prompt.
     """
     try:
         prefs_path = Path.home() / ".ouroboros" / "prefs.json"
         if not prefs_path.exists():
-            return True
+            return not _has_prior_install_state()
         prefs = json.loads(prefs_path.read_text())
         if not isinstance(prefs, dict):
             return True

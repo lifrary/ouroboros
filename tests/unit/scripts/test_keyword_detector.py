@@ -46,6 +46,44 @@ class TestFirstTimePrefs:
         with patch.object(_mod.Path, "home", return_value=tmp_path):
             assert is_first_time() is False
 
+    def test_missing_prefs_but_config_yaml_marks_not_first_time(self, tmp_path):
+        # ``ooo setup`` writes config.yaml, but only the (skippable) welcome
+        # flow writes welcomeCompleted. A configured user without prefs.json
+        # must not be treated as first-time, otherwise the welcome suggestion
+        # is re-injected on every keyword-less prompt forever.
+        ouro_dir = tmp_path / ".ouroboros"
+        ouro_dir.mkdir()
+        (ouro_dir / "config.yaml").write_text("version: 1\n")
+
+        with patch.object(_mod.Path, "home", return_value=tmp_path):
+            assert is_first_time() is False
+
+    def test_missing_prefs_but_db_marks_not_first_time(self, tmp_path):
+        # The event-sourcing DB only exists once the MCP runtime has done real
+        # work — an unambiguous "already used Ouroboros" signal.
+        ouro_dir = tmp_path / ".ouroboros"
+        ouro_dir.mkdir()
+        (ouro_dir / "ouroboros.db").write_bytes(b"")
+
+        with patch.object(_mod.Path, "home", return_value=tmp_path):
+            assert is_first_time() is False
+
+    def test_missing_prefs_but_mcp_registered_marks_not_first_time(self, tmp_path):
+        # MCP registered in ~/.claude/mcp.json means setup has already run.
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "mcp.json").write_text('{"mcpServers": {"ouroboros": {}}}')
+
+        with patch.object(_mod.Path, "home", return_value=tmp_path):
+            assert is_first_time() is False
+
+    def test_pristine_home_is_still_first_time(self, tmp_path):
+        # Regression guard for the discriminator: a truly empty home (no prefs,
+        # no install artifacts, no MCP registration) is still a genuine first
+        # run and SHOULD surface the welcome experience.
+        with patch.object(_mod.Path, "home", return_value=tmp_path):
+            assert is_first_time() is True
+
 
 class TestDetectKeywords:
     def test_ooo_qa_detected(self):
